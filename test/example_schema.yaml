@@ -1,0 +1,40 @@
+lookup:
+  index_table_parquet: test/lookup_table.parquet
+  key_column: group_key
+  order_column: order_idx
+  coord_columns:
+  - coord_a
+  - coord_b
+restore:
+  source:
+    value: value_sparse
+    coords:
+    - coord_a_sparse
+    - coord_b_sparse
+  output:
+    value: value_dense
+    coords:
+    - coord_a_dense
+    - coord_b_dense
+output:
+  pass_through:
+  - record_id
+  - group_key
+  - metric_id
+  - category_code
+  - event_ts
+  - ingest_ts
+  derived:
+  - name: record_prefix
+    from: record_id
+    op: prefix4
+scheme:
+  record_id: TEXT
+  group_key: TEXT
+  metric_id: TINYINT
+  category_code: TEXT
+  value_sparse: FLOAT[]
+  coord_a_sparse: INTEGER[]
+  coord_b_sparse: INTEGER[]
+  event_ts: TIMESTAMP
+  ingest_ts: TIMESTAMP
