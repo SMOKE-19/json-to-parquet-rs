@@ -1,0 +1,17 @@
+[package]
+name = "json_to_parquet_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "json_to_parquet_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27.1", features = ["extension-module"] }
+parquet = "56.2.0"
+arrow-array = "56.2.0"
+arrow-schema = "56.2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+memmap2 = "0.9"

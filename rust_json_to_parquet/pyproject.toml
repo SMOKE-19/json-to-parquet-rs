@@ -1,0 +1,10 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+include = [
+  { path = "python/json_to_parquet_rs/__init__.pyi", format = "wheel" },
+  { path = "python/json_to_parquet_rs/py.typed", format = "wheel" },
+]

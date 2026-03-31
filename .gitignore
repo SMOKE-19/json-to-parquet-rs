@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+rust_json_to_parquet/target/
+rust_json_to_parquet/build/
+rust_json_to_parquet/dist/
+rust_json_to_parquet/python/json_to_parquet_rs/*.so
+
+.DS_Store
