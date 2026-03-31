@@ -83,12 +83,10 @@ from json_to_parquet_rs import convert_json_to_parquet_passthrough
 
 - `convert_json_to_parquet(...)`
 - `convert_json_to_parquet_passthrough(...)`
-- `convert_json_to_parquet_core(...)`
 
 권장 사용:
 
-- 새 코드에서는 `convert_json_to_parquet(...)` 또는 `convert_json_to_parquet_passthrough(...)`
-- 기존 호환이 필요할 때만 `convert_json_to_parquet_core(...)`
+- `convert_json_to_parquet(...)` 또는 `convert_json_to_parquet_passthrough(...)`
 
 ## 사용 패턴
 

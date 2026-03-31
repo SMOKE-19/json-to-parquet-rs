@@ -11,8 +11,6 @@
   - sparse 값과 lookup parquet를 이용해 dense 배열을 복원한 뒤 parquet를 생성한다.
 - `convert_json_to_parquet_passthrough(...)`
   - restore 없이 JSON에서 추출한 컬럼을 그대로 parquet로 저장한다.
-- `convert_json_to_parquet_core(...)`
-  - 기존 호출자 호환을 위한 alias다. 동작은 `convert_json_to_parquet(...)`와 같다.
 
 ## 설치
 
@@ -225,6 +223,5 @@ passthrough 경로에서는 `restore_sec`가 `0.0`으로 반환된다.
 
 ## 호환성 메모
 
-- `convert_json_to_parquet_core(...)`는 제거되지 않았지만 새 코드에서는 `convert_json_to_parquet(...)` 사용을 권장한다.
 - 외부 사용자가 알아야 할 계약은 Python import와 함수 시그니처다.
 - 내부 구현이 Rust인지, 어떤 상위 프로젝트에서 사용되는지는 패키지 사용에 필수 정보가 아니다.

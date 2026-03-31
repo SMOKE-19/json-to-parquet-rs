@@ -15,14 +15,13 @@ import json
 from collections.abc import Mapping
 
 from .json_to_parquet_rs import (
-    convert_json_to_parquet as _convert_json_to_parquet_core,
+    convert_json_to_parquet as _convert_json_to_parquet_impl,
     convert_json_to_parquet_passthrough as _convert_json_to_parquet_passthrough,
 )
 
 __all__ = [
     "convert_json_to_parquet",
     "convert_json_to_parquet_passthrough",
-    "convert_json_to_parquet_core",
 ]
 
 
@@ -37,7 +36,7 @@ def convert_json_to_parquet(
 ) -> dict[str, float]:
     """저장된 JSON 파일을 Rust mmap 파서로 parquet로 변환한다."""
 
-    return _convert_json_to_parquet_core(
+    return _convert_json_to_parquet_impl(
         input_json_path,
         output_parquet_path,
         lookup_path,
@@ -65,26 +64,4 @@ def convert_json_to_parquet_passthrough(
         schema,
         json.dumps(config, ensure_ascii=True),
         sample_rows,
-    )
-
-
-def convert_json_to_parquet_core(
-    input_json_path: str,
-    output_parquet_path: str,
-    lookup_path: str,
-    columns: list[str],
-    schema: dict[str, str],
-    config: Mapping[str, object],
-    sample_rows: int | None = None,
-) -> dict[str, float]:
-    """기존 dense-restore 진입점 호환 alias."""
-
-    return convert_json_to_parquet(
-        input_json_path=input_json_path,
-        output_parquet_path=output_parquet_path,
-        lookup_path=lookup_path,
-        columns=columns,
-        schema=schema,
-        config=config,
-        sample_rows=sample_rows,
     )
