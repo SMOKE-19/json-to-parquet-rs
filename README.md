@@ -3,7 +3,7 @@
 `json_to_parquet_rs`는 저장된 JSON 파일을 typed Parquet 파일로 변환하는 Python 패키지다.
 패키지 내부에서 Rust 확장을 사용하지만, 외부 사용자는 Python API만 알면 된다.
 
-빌드와 배포 절차는 [`build.md`](/home/smoke_nb_sv/dev/projects/json-to-parquet-rs/build.md)에 정리되어 있다.
+빌드와 배포 절차는 [`build.md`](./build.md)에 정리되어 있다.
 
 ## 무엇을 제공하나
 

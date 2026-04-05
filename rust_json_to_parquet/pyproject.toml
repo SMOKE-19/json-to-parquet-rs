@@ -2,9 +2,14 @@
 requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
+[project]
+name = "json_to_parquet_rs"
+version = "0.1.0"
+requires-python = ">=3.10"
+
 [tool.maturin]
-python-source = "python"
+python-source = "src"
 include = [
-  { path = "python/json_to_parquet_rs/__init__.pyi", format = "wheel" },
-  { path = "python/json_to_parquet_rs/py.typed", format = "wheel" },
+  { path = "src/json_to_parquet_rs/__init__.pyi", format = "wheel" },
+  { path = "src/json_to_parquet_rs/py.typed", format = "wheel" },
 ]
