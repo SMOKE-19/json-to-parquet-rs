@@ -3,6 +3,32 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::time::Instant;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsonValueScanKind {
+    StringScalar,
+    BareScalar,
+    JsonContainer,
+}
+
+fn normalize_dtype(dtype: &str) -> &str {
+    match dtype {
+        "TEXT" | "Utf8" | "String" => "TEXT",
+        "DATE" | "Date" => "DATE",
+        "TIMESTAMP" | "Datetime" => "TIMESTAMP",
+        "TINYINT" | "Int8" => "TINYINT",
+        "INTEGER" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" => {
+            "INTEGER"
+        }
+        "FLOAT" | "Float32" => "FLOAT",
+        "DOUBLE" | "Float64" => "DOUBLE",
+        "INTEGER[]" | "List(Int8)" | "List(Int16)" | "List(Int32)" | "List(Int64)" => "INTEGER[]",
+        "FLOAT[]" | "List(Float32)" => "FLOAT[]",
+        "DOUBLE[]" | "List(Float64)" => "DOUBLE[]",
+        "TEXT[]" | "List(Utf8)" | "List(String)" => "TEXT[]",
+        _ => dtype,
+    }
+}
+
 fn skip_ws(bytes: &[u8], mut index: usize) -> usize {
     while index < bytes.len() && matches!(bytes[index], b' ' | b'\t' | b'\r' | b'\n') {
         index += 1;
@@ -10,7 +36,7 @@ fn skip_ws(bytes: &[u8], mut index: usize) -> usize {
     index
 }
 
-fn parse_json_string(bytes: &[u8], start: usize) -> pyo3::PyResult<(String, usize)> {
+fn find_json_string_end(bytes: &[u8], start: usize) -> pyo3::PyResult<usize> {
     if start >= bytes.len() || bytes[start] != b'"' {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "expected JSON string",
@@ -18,22 +44,17 @@ fn parse_json_string(bytes: &[u8], start: usize) -> pyo3::PyResult<(String, usiz
     }
 
     let mut index = start + 1;
-    let mut escaped = false;
     while index < bytes.len() {
-        match bytes[index] {
-            b'\\' if !escaped => escaped = true,
-            b'"' if !escaped => {
-                let raw = std::str::from_utf8(&bytes[start..=index]).map_err(|err| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "invalid utf-8 in JSON key: {err}"
-                    ))
-                })?;
-                let parsed: String = serde_json::from_str(raw).map_err(|err| {
-                    pyo3::exceptions::PyValueError::new_err(format!("invalid JSON string: {err}"))
-                })?;
-                return Ok((parsed, index + 1));
+        if bytes[index] == b'"' {
+            let mut backslash_count = 0usize;
+            let mut cursor = index;
+            while cursor > start && bytes[cursor - 1] == b'\\' {
+                backslash_count += 1;
+                cursor -= 1;
             }
-            _ => escaped = false,
+            if backslash_count % 2 == 0 {
+                return Ok(index + 1);
+            }
         }
         index += 1;
     }
@@ -41,6 +62,17 @@ fn parse_json_string(bytes: &[u8], start: usize) -> pyo3::PyResult<(String, usiz
     Err(pyo3::exceptions::PyValueError::new_err(
         "unterminated JSON string",
     ))
+}
+
+fn parse_json_string(bytes: &[u8], start: usize) -> pyo3::PyResult<(String, usize)> {
+    let end = find_json_string_end(bytes, start)?;
+    let raw = std::str::from_utf8(&bytes[start..end]).map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid utf-8 in JSON key: {err}"))
+    })?;
+    let parsed: String = serde_json::from_str(raw).map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid JSON string: {err}"))
+    })?;
+    Ok((parsed, end))
 }
 
 fn skip_json_value(bytes: &[u8], start: usize) -> pyo3::PyResult<usize> {
@@ -103,6 +135,74 @@ fn skip_json_value(bytes: &[u8], start: usize) -> pyo3::PyResult<usize> {
     }
 }
 
+fn scan_bare_scalar_end(bytes: &[u8], start: usize) -> usize {
+    let mut pos = start;
+    while pos < bytes.len()
+        && !matches!(
+            bytes[pos],
+            b',' | b']' | b'}' | b' ' | b'\t' | b'\r' | b'\n'
+        )
+    {
+        pos += 1;
+    }
+    pos
+}
+
+fn scan_kind_for_dtype(column: &str, dtype: &str) -> pyo3::PyResult<JsonValueScanKind> {
+    match normalize_dtype(dtype) {
+        "TEXT" | "TIMESTAMP" | "DATE" => Ok(JsonValueScanKind::StringScalar),
+        "TINYINT" | "INTEGER" | "DOUBLE" | "FLOAT" => Ok(JsonValueScanKind::BareScalar),
+        dtype if dtype.starts_with("DECIMAL(") => Ok(JsonValueScanKind::BareScalar),
+        "INTEGER[]" | "FLOAT[]" | "DOUBLE[]" | "TEXT[]" => Ok(JsonValueScanKind::JsonContainer),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unsupported schema type '{other}' for column '{column}'"
+        ))),
+    }
+}
+
+fn scan_column_value_range(
+    bytes: &[u8],
+    start: usize,
+    kind: JsonValueScanKind,
+) -> pyo3::PyResult<(usize, usize, usize)> {
+    let start = skip_ws(bytes, start);
+    if start >= bytes.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "unexpected end of JSON while scanning column value",
+        ));
+    }
+
+    match kind {
+        JsonValueScanKind::StringScalar => {
+            if bytes[start] == b'"' {
+                let next = find_json_string_end(bytes, start)?;
+                Ok((start + 1, next - 1, next))
+            } else {
+                let next = scan_bare_scalar_end(bytes, start);
+                Ok((start, next, next))
+            }
+        }
+        JsonValueScanKind::BareScalar => {
+            if bytes[start] == b'"' {
+                let next = find_json_string_end(bytes, start)?;
+                Ok((start + 1, next - 1, next))
+            } else {
+                let next = scan_bare_scalar_end(bytes, start);
+                Ok((start, next, next))
+            }
+        }
+        JsonValueScanKind::JsonContainer => {
+            if bytes[start] == b'"' {
+                let next = find_json_string_end(bytes, start)?;
+                Ok((start + 1, next - 1, next))
+            } else {
+                let next = skip_json_value(bytes, start)?;
+                Ok((start, next, next))
+            }
+        }
+    }
+}
+
 fn extract_top_level_column_order(bytes: &[u8]) -> pyo3::PyResult<Vec<String>> {
     let mut index = skip_ws(bytes, 0);
     if index >= bytes.len() || bytes[index] != b'{' {
@@ -144,7 +244,7 @@ fn extract_top_level_column_order(bytes: &[u8]) -> pyo3::PyResult<Vec<String>> {
 }
 
 fn validate_value_type(column: &str, raw_value: &str, dtype: &str) -> pyo3::PyResult<()> {
-    match dtype {
+    match normalize_dtype(dtype) {
         "TEXT" | "TIMESTAMP" | "DATE" => Ok(()),
         "TINYINT" | "INTEGER" => {
             raw_value.parse::<i32>().map_err(|err| {
@@ -185,6 +285,24 @@ fn validate_value_type(column: &str, raw_value: &str, dtype: &str) -> pyo3::PyRe
                     "Column '{column}' type mismatch: expected INTEGER[], got {err}"
                 ))
             })?;
+            Ok(())
+        }
+        "TEXT[]" => {
+            let value: serde_json::Value = serde_json::from_str(raw_value).map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Column '{column}' type mismatch: expected TEXT[], got {err}"
+                ))
+            })?;
+            let array = value.as_array().ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Column '{column}' type mismatch: expected TEXT[]"
+                ))
+            })?;
+            if array.iter().any(|item| !item.is_string()) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Column '{column}' type mismatch: expected TEXT[] with string elements"
+                )));
+            }
             Ok(())
         }
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -232,6 +350,7 @@ fn validate_first_row_types(
 pub fn scan_json_column_offsets(
     bytes: &[u8],
     columns: &[String],
+    schema: &HashMap<String, String>,
 ) -> pyo3::PyResult<(HashMap<String, Vec<(usize, usize)>>, usize)> {
     let mut offsets: HashMap<String, Vec<(usize, usize)>> =
         columns.iter().map(|c| (c.clone(), Vec::new())).collect();
@@ -338,41 +457,17 @@ pub fn scan_json_column_offsets(
                     }
                     curr_col = None;
                 }
-                b'"' => {
-                    let start = i + 1;
-                    let mut j = start;
-                    loop {
-                        while j < size && bytes[j] != b'"' {
-                            j += 1;
-                        }
-                        if j >= size {
-                            break;
-                        }
-                        if j == 0 || bytes[j - 1] != b'\\' {
-                            break;
-                        }
-                        j += 1;
-                    }
-
-                    let col = curr_col.as_ref().ok_or_else(|| {
-                        pyo3::exceptions::PyValueError::new_err("json scan parser state error")
-                    })?;
-                    offsets
-                        .get_mut(col)
-                        .ok_or_else(|| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "missing offsets for column {col}"
-                            ))
-                        })?
-                        .push((start, j));
-                    i = j + 1;
-                }
                 _ => {
-                    let start = i;
-                    let end = skip_json_value(bytes, i)?;
                     let col = curr_col.as_ref().ok_or_else(|| {
                         pyo3::exceptions::PyValueError::new_err("json scan parser state error")
                     })?;
+                    let dtype = schema.get(col).ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "schema missing type for column '{col}'"
+                        ))
+                    })?;
+                    let kind = scan_kind_for_dtype(col, dtype)?;
+                    let (start, end, next_index) = scan_column_value_range(bytes, i, kind)?;
                     offsets
                         .get_mut(col)
                         .ok_or_else(|| {
@@ -381,7 +476,7 @@ pub fn scan_json_column_offsets(
                             ))
                         })?
                         .push((start, end));
-                    i = end;
+                    i = next_index;
                 }
             }
             continue;
@@ -445,7 +540,7 @@ pub fn extract_json_columns_profiled(
     validate_json_column_order(&mmap, columns)?;
 
     let scan_started = Instant::now();
-    let (offsets, total_rows) = scan_json_column_offsets(&mmap, columns)?;
+    let (offsets, total_rows) = scan_json_column_offsets(&mmap, columns, schema)?;
     let scan_elapsed = scan_started.elapsed().as_secs_f64();
 
     let nrows = sample_rows
@@ -501,8 +596,14 @@ mod tests {
             "coord_a_sparse".to_string(),
             "coord_b_sparse".to_string(),
         ];
+        let schema = HashMap::from([
+            ("record_id".to_string(), "TEXT".to_string()),
+            ("value_sparse".to_string(), "DOUBLE[]".to_string()),
+            ("coord_a_sparse".to_string(), "INTEGER[]".to_string()),
+            ("coord_b_sparse".to_string(), "INTEGER[]".to_string()),
+        ]);
 
-        let (offsets, row_count) = scan_json_column_offsets(payload, &columns).unwrap();
+        let (offsets, row_count) = scan_json_column_offsets(payload, &columns, &schema).unwrap();
         assert_eq!(row_count, 2);
         assert_eq!(offsets["record_id"].len(), 2);
         assert_eq!(offsets["value_sparse"].len(), 2);

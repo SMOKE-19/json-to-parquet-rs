@@ -134,16 +134,28 @@ class CoreConversionTests(unittest.TestCase):
             self.assertTrue(output_path.exists())
 
     def test_convert_json_to_parquet_passthrough(self) -> None:
+        payload = json.loads(self.sample_json.read_text(encoding="utf-8"))
+        scalar_columns = [
+            "record_id",
+            "group_key",
+            "metric_id",
+            "category_code",
+            "event_ts",
+            "ingest_ts",
+        ]
+        scalar_payload = {key: payload[key] for key in scalar_columns}
         with tempfile.TemporaryDirectory() as temp_dir:
+            scalar_json = Path(temp_dir) / "sample.scalar.json"
+            scalar_json.write_text(json.dumps(scalar_payload, ensure_ascii=False), encoding="utf-8")
             output_path = Path(temp_dir) / "sample.passthrough.parquet"
             profile = convert_json_to_parquet_passthrough(
-                input_json_path=str(self.sample_json),
+                input_json_path=str(scalar_json),
                 output_parquet_path=str(output_path),
-                columns=self.columns,
+                columns=scalar_columns,
                 schema=self.schema,
                 config={
                     "output": {
-                        "pass_through": self.columns,
+                        "pass_through": scalar_columns,
                         "derived": [],
                     }
                 },
@@ -156,19 +168,13 @@ class CoreConversionTests(unittest.TestCase):
             result = con.execute(
                 """
                 SELECT
-                  COUNT(*) AS row_count,
-                  array_length(value_sparse) AS value_len,
-                  array_length(coord_a_sparse) AS coord_a_len,
-                  array_length(coord_b_sparse) AS coord_b_len
+                  COUNT(*) AS row_count
                 FROM read_parquet(?)
-                GROUP BY 2, 3, 4
                 """,
                 [str(output_path)],
-            ).fetchall()
-            self.assertEqual(sum(row_count for row_count, *_ in result), 3)
-            for _, value_len, coord_a_len, coord_b_len in result:
-                self.assertEqual(value_len, coord_a_len)
-                self.assertEqual(value_len, coord_b_len)
+            ).fetchone()
+            assert result is not None
+            self.assertEqual(result[0], 3)
 
     def test_convert_json_to_parquet_accepts_print_timing_option(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -187,16 +193,28 @@ class CoreConversionTests(unittest.TestCase):
             self.assertTrue(output_path.exists())
 
     def test_convert_json_to_parquet_passthrough_accepts_print_timing_option(self) -> None:
+        payload = json.loads(self.sample_json.read_text(encoding="utf-8"))
+        scalar_columns = [
+            "record_id",
+            "group_key",
+            "metric_id",
+            "category_code",
+            "event_ts",
+            "ingest_ts",
+        ]
+        scalar_payload = {key: payload[key] for key in scalar_columns}
         with tempfile.TemporaryDirectory() as temp_dir:
+            scalar_json = Path(temp_dir) / "sample.scalar.json"
+            scalar_json.write_text(json.dumps(scalar_payload, ensure_ascii=False), encoding="utf-8")
             output_path = Path(temp_dir) / "sample.passthrough_timing.parquet"
             profile = convert_json_to_parquet_passthrough(
-                input_json_path=str(self.sample_json),
+                input_json_path=str(scalar_json),
                 output_parquet_path=str(output_path),
-                columns=self.columns,
+                columns=scalar_columns,
                 schema=self.schema,
                 config={
                     "output": {
-                        "pass_through": self.columns,
+                        "pass_through": scalar_columns,
                         "derived": [],
                     }
                 },
@@ -205,6 +223,64 @@ class CoreConversionTests(unittest.TestCase):
             )
             self.assertEqual(profile["rows"], 2.0)
             self.assertTrue(output_path.exists())
+
+    def test_convert_json_to_parquet_passthrough_accepts_polars_type_aliases(self) -> None:
+        schema = {
+            "record_id": "String",
+            "group_key": "Utf8",
+            "metric_id": "Int64",
+            "category_code": "Utf8",
+            "value_sparse": "List(Float64)",
+            "coord_a_sparse": "List(Int32)",
+            "coord_b_sparse": "List(Int32)",
+            "event_ts": "Datetime",
+            "ingest_ts": "Datetime",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "sample.alias.parquet"
+            with self.assertRaisesRegex(ValueError, "does not support list columns"):
+                convert_json_to_parquet_passthrough(
+                    input_json_path=str(self.sample_json),
+                    output_parquet_path=str(output_path),
+                    columns=self.columns,
+                    schema=schema,
+                    config={
+                        "output": {
+                            "pass_through": self.columns,
+                            "derived": [],
+                        }
+                    },
+                    sample_rows=1,
+                )
+
+            payload = json.loads(self.sample_json.read_text(encoding="utf-8"))
+            scalar_columns = [
+                "record_id",
+                "group_key",
+                "metric_id",
+                "category_code",
+                "event_ts",
+                "ingest_ts",
+            ]
+            scalar_payload = {key: payload[key] for key in scalar_columns}
+            scalar_json = Path(temp_dir) / "sample.alias.scalar.json"
+            scalar_json.write_text(json.dumps(scalar_payload, ensure_ascii=False), encoding="utf-8")
+            scalar_output_path = Path(temp_dir) / "sample.alias.scalar.parquet"
+            profile = convert_json_to_parquet_passthrough(
+                input_json_path=str(scalar_json),
+                output_parquet_path=str(scalar_output_path),
+                columns=scalar_columns,
+                schema=schema,
+                config={
+                    "output": {
+                        "pass_through": scalar_columns,
+                        "derived": [],
+                    }
+                },
+                sample_rows=2,
+            )
+            self.assertEqual(profile["rows"], 2.0)
+            self.assertTrue(scalar_output_path.exists())
 
 
 if __name__ == "__main__":

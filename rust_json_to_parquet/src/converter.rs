@@ -112,6 +112,25 @@ struct RestoreColumns {
     coord_rows: Vec<Vec<Vec<i32>>>,
 }
 
+fn normalize_dtype(dtype: &str) -> &str {
+    match dtype {
+        "TEXT" | "Utf8" | "String" => "TEXT",
+        "DATE" | "Date" => "DATE",
+        "TIMESTAMP" | "Datetime" => "TIMESTAMP",
+        "TINYINT" | "Int8" => "TINYINT",
+        "INTEGER" | "Int16" | "Int32" | "Int64" | "UInt8" | "UInt16" | "UInt32" | "UInt64" => {
+            "INTEGER"
+        }
+        "FLOAT" | "Float32" => "FLOAT",
+        "DOUBLE" | "Float64" => "DOUBLE",
+        "INTEGER[]" | "List(Int8)" | "List(Int16)" | "List(Int32)" | "List(Int64)" => "INTEGER[]",
+        "FLOAT[]" | "List(Float32)" => "FLOAT[]",
+        "DOUBLE[]" | "List(Float64)" => "DOUBLE[]",
+        "TEXT[]" | "List(Utf8)" | "List(String)" => "TEXT[]",
+        _ => dtype,
+    }
+}
+
 fn parse_conversion_config(config_json: &str) -> pyo3::PyResult<ConversionConfig> {
     let config: ConversionConfig = serde_json::from_str(config_json).map_err(|err| {
         pyo3::exceptions::PyValueError::new_err(format!("invalid conversion config: {err}"))
@@ -202,6 +221,18 @@ fn parse_string_list_values(raw_values: &[String], name: &str) -> pyo3::PyResult
         .collect()
 }
 
+fn normalized_schema_type<'a>(
+    schema: &'a HashMap<String, String>,
+    column_name: &str,
+) -> pyo3::PyResult<&'a str> {
+    let dtype = schema.get(column_name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "missing schema type for pass-through column {column_name}"
+        ))
+    })?;
+    Ok(normalize_dtype(dtype))
+}
+
 fn parse_scalar_outputs(
     extracted: &HashMap<String, Vec<String>>,
     schema: &HashMap<String, String>,
@@ -210,12 +241,7 @@ fn parse_scalar_outputs(
     let mut outputs = Vec::with_capacity(config.output.pass_through.len());
     for column_name in &config.output.pass_through {
         let raw_values = required_column(extracted, column_name)?.clone();
-        let dtype = schema.get(column_name).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "missing schema type for pass-through column {column_name}"
-            ))
-        })?;
-        let values = match dtype.as_str() {
+        let values = match normalized_schema_type(schema, column_name)? {
             "TEXT" | "TIMESTAMP" | "DATE" => OutputColumnValues::Utf8(raw_values),
             "TINYINT" | "INTEGER" => {
                 OutputColumnValues::Int32(parse_i32_values(&raw_values, column_name)?)
@@ -246,6 +272,63 @@ fn parse_scalar_outputs(
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "unsupported pass-through type {other} for column {column_name}"
                 )))
+            }
+        };
+        outputs.push(OutputColumn {
+            name: column_name.clone(),
+            values,
+        });
+    }
+    Ok(outputs)
+}
+
+fn validate_passthrough_scalar_schema(
+    schema: &HashMap<String, String>,
+    pass_through: &[String],
+) -> pyo3::PyResult<()> {
+    for column_name in pass_through {
+        let dtype = normalized_schema_type(schema, column_name)?;
+        match dtype {
+            "TEXT" | "TIMESTAMP" | "DATE" | "TINYINT" | "INTEGER" | "FLOAT" | "DOUBLE" => {}
+            other if other.starts_with("DECIMAL(") => {}
+            "INTEGER[]" | "FLOAT[]" | "DOUBLE[]" | "TEXT[]" => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "passthrough fast path does not support list columns: {column_name} has type {dtype}"
+                )));
+            }
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unsupported passthrough schema type {other} for column {column_name}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_passthrough_scalar_outputs(
+    extracted: &HashMap<String, Vec<String>>,
+    schema: &HashMap<String, String>,
+    pass_through: &[String],
+) -> pyo3::PyResult<Vec<OutputColumn>> {
+    let mut outputs = Vec::with_capacity(pass_through.len());
+    for column_name in pass_through {
+        let raw_values = required_column(extracted, column_name)?.clone();
+        let values = match normalized_schema_type(schema, column_name)? {
+            "TEXT" | "TIMESTAMP" | "DATE" => OutputColumnValues::Utf8(raw_values),
+            "TINYINT" | "INTEGER" => {
+                OutputColumnValues::Int32(parse_i32_values(&raw_values, column_name)?)
+            }
+            "FLOAT" | "DOUBLE" => {
+                OutputColumnValues::Float64(parse_f64_values(&raw_values, column_name)?)
+            }
+            other if other.starts_with("DECIMAL(") => {
+                OutputColumnValues::Float64(parse_f64_values(&raw_values, column_name)?)
+            }
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "passthrough fast path does not support type {other} for column {column_name}"
+                )));
             }
         };
         outputs.push(OutputColumn {
@@ -574,6 +657,7 @@ pub fn convert_json_to_parquet_passthrough_impl(
 ) -> pyo3::PyResult<HashMap<String, f64>> {
     let total_started = Instant::now();
     let config = parse_passthrough_config(&config_json)?;
+    validate_passthrough_scalar_schema(&schema, &config.output.pass_through)?;
 
     let extract_started = Instant::now();
     let (extracted, extract_profile) =
@@ -581,25 +665,8 @@ pub fn convert_json_to_parquet_passthrough_impl(
     let extract_sec = extract_started.elapsed().as_secs_f64();
 
     let parse_scalar_started = Instant::now();
-    let fake_config = ConversionConfig {
-        lookup: LookupConfig {
-            key_column: String::new(),
-            order_column: String::new(),
-            coord_columns: Vec::new(),
-        },
-        restore: RestoreConfig {
-            source: RestoreSourceConfig {
-                value: String::new(),
-                coords: Vec::new(),
-            },
-            output: RestoreOutputConfig {
-                value: String::new(),
-                coords: Vec::new(),
-            },
-        },
-        output: config.output,
-    };
-    let scalar_outputs = parse_scalar_outputs(&extracted, &schema, &fake_config)?;
+    let scalar_outputs =
+        parse_passthrough_scalar_outputs(&extracted, &schema, &config.output.pass_through)?;
     let parse_scalar_sec = parse_scalar_started.elapsed().as_secs_f64();
 
     let arrow_started = Instant::now();

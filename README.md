@@ -10,7 +10,7 @@
 - `convert_json_to_parquet(...)`
   - sparse 값과 lookup parquet를 이용해 dense 배열을 복원한 뒤 parquet를 생성한다.
 - `convert_json_to_parquet_passthrough(...)`
-  - restore 없이 JSON에서 추출한 컬럼을 그대로 parquet로 저장한다.
+  - restore 없이 JSON에서 추출한 scalar 컬럼만 그대로 parquet로 저장한다.
 
 ## 설치
 
@@ -80,15 +80,16 @@ from json_to_parquet_rs import convert_json_to_parquet_passthrough
 profile = convert_json_to_parquet_passthrough(
     input_json_path="sample_input.json",
     output_parquet_path="sample_passthrough.parquet",
-    columns=["record_id", "tags", "scores"],
+    columns=["record_id", "group_key", "metric_id", "event_ts"],
     schema={
         "record_id": "TEXT",
-        "tags": "TEXT[]",
-        "scores": "DOUBLE[]",
+        "group_key": "TEXT",
+        "metric_id": "INTEGER",
+        "event_ts": "TIMESTAMP",
     },
     config={
         "output": {
-            "pass_through": ["record_id", "tags", "scores"],
+            "pass_through": ["record_id", "group_key", "metric_id", "event_ts"],
             "derived": [],
         },
     },
@@ -184,11 +185,17 @@ convert_json_to_parquet_passthrough(
 ```python
 config = {
     "output": {
-        "pass_through": ["record_id", "tags", "scores"],
+        "pass_through": ["record_id", "group_key", "metric_id", "event_ts"],
         "derived": [],
     },
 }
 ```
+
+중요한 규약:
+
+- `passthrough`는 scalar-only fast path다.
+- `TEXT[]`, `INTEGER[]`, `DOUBLE[]`, `List(...)` 계열 list 컬럼은 지원하지 않는다.
+- list 컬럼이 필요하면 `convert_json_to_parquet(...)` 경로를 사용해야 한다.
 
 ## 타이밍 출력 옵션
 
@@ -222,6 +229,9 @@ passthrough 경로 예시:
 
 - `TEXT`
 - `INTEGER`
+- `TINYINT`
+- `DATE`
+- `TIMESTAMP`
 - `FLOAT`
 - `DOUBLE`
 - `DECIMAL(...)`
@@ -231,6 +241,16 @@ passthrough 경로 예시:
 
 배열 타입은 입력 JSON에서 JSON 배열 문자열 형태로 들어와야 한다.
 예를 들어 `TEXT[]` 컬럼 값은 `"[\\"a\\", \\"b\\"]"` 같은 형태를 기대한다.
+
+Polars 스타일 alias도 함께 받을 수 있다.
+
+- 문자열: `Utf8`, `String`
+- 정수: `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`, `UInt64`
+- 실수: `Float32`, `Float64`
+- 날짜/시간: `Date`, `Datetime`
+- 배열: `List(Int32)`, `List(Float64)`, `List(Utf8)` 등
+
+내부에서는 위 alias를 기본 타입으로 normalize 해서 처리한다.
 
 ## 반환값
 
@@ -251,7 +271,23 @@ passthrough 경로에서는 `restore_sec`가 `0.0`으로 반환된다.
 
 - 입력은 이미 저장된 JSON 파일 경로를 받는다.
 - Python에서 입력 전체를 재구성하지 않고 Rust 확장이 파싱과 parquet 생성을 담당한다.
+- JSON offset scan은 주입된 `schema`를 기준으로 string/scalar/container fast path를 나눠 처리한다.
 - 결과 parquet 스키마는 `schema`와 `config.output`에 의해 결정된다.
+
+## 프로젝트 구조
+
+- `rust_json_to_parquet/pyproject.toml`
+  - Python 패키지 메타데이터
+- `rust_json_to_parquet/Cargo.toml`
+  - Rust crate 설정
+- `rust_json_to_parquet/src/json_to_parquet_rs/__init__.py`
+  - Python 공개 래퍼
+- `rust_json_to_parquet/src/`
+  - Rust 구현
+- `rust_json_to_parquet/test/`
+  - 샘플 입력과 lookup parquet
+- `tests/test_core.py`
+  - 공개 API 기준 통합 테스트
 
 ## 호환성 메모
 
