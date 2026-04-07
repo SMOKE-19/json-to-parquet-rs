@@ -12,6 +12,37 @@ use std::time::Instant;
 use crate::json_parser::extract_json_columns_profiled;
 use crate::reference::{build_dense_index, load_reference_map, restore_dense_row, DenseRow};
 
+fn emit_timing(stage_kind: &str, input_json_path: &str, output_parquet_path: &str, stats: &HashMap<String, f64>) {
+    println!(
+        "[json_to_parquet_rs] stage={stage_kind} input_json_path={input_json_path} output_parquet_path={output_parquet_path}"
+    );
+    let ordered_keys = [
+        "rows",
+        "rows_total",
+        "rows_materialized",
+        "extract_file_open_sec",
+        "extract_mmap_sec",
+        "extract_scan_offsets_sec",
+        "extract_materialize_strings_sec",
+        "extract_sec",
+        "reference_load_sec",
+        "parse_scalar_sec",
+        "parse_float_sec",
+        "parse_il1_sec",
+        "parse_il2_sec",
+        "dense_fill_sec",
+        "restore_sec",
+        "arrow_batch_build_sec",
+        "parquet_write_sec",
+        "total_sec",
+    ];
+    for key in ordered_keys {
+        if let Some(value) = stats.get(key) {
+            println!("[json_to_parquet_rs]   {key}={value:.6}");
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ConversionConfig {
     lookup: LookupConfig,
@@ -465,6 +496,7 @@ pub fn convert_json_to_parquet_impl(
     schema: HashMap<String, String>,
     config_json: String,
     sample_rows: Option<usize>,
+    print_timing: bool,
 ) -> pyo3::PyResult<HashMap<String, f64>> {
     let total_started = Instant::now();
     let config = parse_conversion_config(&config_json)?;
@@ -520,6 +552,14 @@ pub fn convert_json_to_parquet_impl(
     for (key, value) in extract_profile {
         stats.insert(format!("extract_{key}"), value);
     }
+    if print_timing {
+        emit_timing(
+            "restore",
+            &input_json_path,
+            &output_parquet_path,
+            &stats,
+        );
+    }
     Ok(stats)
 }
 
@@ -530,6 +570,7 @@ pub fn convert_json_to_parquet_passthrough_impl(
     schema: HashMap<String, String>,
     config_json: String,
     sample_rows: Option<usize>,
+    print_timing: bool,
 ) -> pyo3::PyResult<HashMap<String, f64>> {
     let total_started = Instant::now();
     let config = parse_passthrough_config(&config_json)?;
@@ -588,6 +629,14 @@ pub fn convert_json_to_parquet_passthrough_impl(
     );
     for (key, value) in extract_profile {
         stats.insert(format!("extract_{key}"), value);
+    }
+    if print_timing {
+        emit_timing(
+            "passthrough",
+            &input_json_path,
+            &output_parquet_path,
+            &stats,
+        );
     }
     Ok(stats)
 }

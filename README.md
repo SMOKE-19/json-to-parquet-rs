@@ -66,6 +66,7 @@ profile = convert_json_to_parquet(
             "derived": [],
         },
     },
+    print_timing=True,
 )
 
 print(profile["rows"])
@@ -91,6 +92,7 @@ profile = convert_json_to_parquet_passthrough(
             "derived": [],
         },
     },
+    print_timing=True,
 )
 
 print(profile["total_sec"])
@@ -111,6 +113,7 @@ convert_json_to_parquet(
     schema: dict[str, str],
     config: Mapping[str, object],
     sample_rows: int | None = None,
+    print_timing: bool = False,
 ) -> dict[str, float]
 ```
 
@@ -130,6 +133,8 @@ convert_json_to_parquet(
   - lookup, restore, output 구성을 담은 매핑
 - `sample_rows`
   - 일부 행만 테스트할 때 사용하는 선택 인자
+- `print_timing`
+  - `True`면 Rust 내부 단계별 시간을 stdout으로 출력하는 선택 인자
 
 필수 `config` 구조:
 
@@ -169,6 +174,7 @@ convert_json_to_parquet_passthrough(
     schema: dict[str, str],
     config: Mapping[str, object],
     sample_rows: int | None = None,
+    print_timing: bool = False,
 ) -> dict[str, float]
 ```
 
@@ -182,6 +188,32 @@ config = {
         "derived": [],
     },
 }
+```
+
+## 타이밍 출력 옵션
+
+두 API 모두 `print_timing=True`를 주면 내부 단계 프로파일을 stdout에 출력한다.
+
+restore 경로 예시:
+
+```text
+[json_to_parquet_rs] stage=restore input_json_path=... output_parquet_path=...
+[json_to_parquet_rs]   extract_scan_offsets_sec=...
+[json_to_parquet_rs]   reference_load_sec=...
+[json_to_parquet_rs]   parse_scalar_sec=...
+[json_to_parquet_rs]   restore_sec=...
+[json_to_parquet_rs]   parquet_write_sec=...
+[json_to_parquet_rs]   total_sec=...
+```
+
+passthrough 경로 예시:
+
+```text
+[json_to_parquet_rs] stage=passthrough input_json_path=... output_parquet_path=...
+[json_to_parquet_rs]   extract_scan_offsets_sec=...
+[json_to_parquet_rs]   parse_scalar_sec=...
+[json_to_parquet_rs]   parquet_write_sec=...
+[json_to_parquet_rs]   total_sec=...
 ```
 
 ## 타입 규약

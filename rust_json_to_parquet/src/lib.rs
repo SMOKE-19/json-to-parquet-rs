@@ -8,7 +8,7 @@ mod reference;
 
 #[pyfunction]
 #[pyo3(
-    text_signature = "(input_json_path, output_parquet_path, lookup_path, columns, schema, config_json, sample_rows=None)"
+    text_signature = "(input_json_path, output_parquet_path, lookup_path, columns, schema, config_json, sample_rows=None, print_timing=False)"
 )]
 fn convert_json_to_parquet(
     input_json_path: String,
@@ -18,6 +18,7 @@ fn convert_json_to_parquet(
     schema: HashMap<String, String>,
     config_json: String,
     sample_rows: Option<usize>,
+    print_timing: bool,
 ) -> PyResult<HashMap<String, f64>> {
     converter::convert_json_to_parquet_impl(
         input_json_path,
@@ -27,12 +28,13 @@ fn convert_json_to_parquet(
         schema,
         config_json,
         sample_rows,
+        print_timing,
     )
 }
 
 #[pyfunction]
 #[pyo3(
-    text_signature = "(input_json_path, output_parquet_path, columns, schema, config_json, sample_rows=None)"
+    text_signature = "(input_json_path, output_parquet_path, columns, schema, config_json, sample_rows=None, print_timing=False)"
 )]
 fn convert_json_to_parquet_passthrough(
     input_json_path: String,
@@ -41,6 +43,7 @@ fn convert_json_to_parquet_passthrough(
     schema: HashMap<String, String>,
     config_json: String,
     sample_rows: Option<usize>,
+    print_timing: bool,
 ) -> PyResult<HashMap<String, f64>> {
     converter::convert_json_to_parquet_passthrough_impl(
         input_json_path,
@@ -49,6 +52,7 @@ fn convert_json_to_parquet_passthrough(
         schema,
         config_json,
         sample_rows,
+        print_timing,
     )
 }
 

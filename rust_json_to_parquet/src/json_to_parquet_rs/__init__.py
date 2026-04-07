@@ -33,6 +33,7 @@ def convert_json_to_parquet(
     schema: dict[str, str],
     config: Mapping[str, object],
     sample_rows: int | None = None,
+    print_timing: bool = False,
 ) -> dict[str, float]:
     """저장된 JSON 파일을 Rust mmap 파서로 parquet로 변환한다."""
 
@@ -44,6 +45,7 @@ def convert_json_to_parquet(
         schema,
         json.dumps(config, ensure_ascii=True),
         sample_rows,
+        print_timing,
     )
 
 
@@ -54,6 +56,7 @@ def convert_json_to_parquet_passthrough(
     schema: dict[str, str],
     config: Mapping[str, object],
     sample_rows: int | None = None,
+    print_timing: bool = False,
 ) -> dict[str, float]:
     """저장된 JSON 파일을 restore 없이 parquet로 변환한다."""
 
@@ -64,4 +67,5 @@ def convert_json_to_parquet_passthrough(
         schema,
         json.dumps(config, ensure_ascii=True),
         sample_rows,
+        print_timing,
     )

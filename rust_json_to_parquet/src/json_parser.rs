@@ -281,19 +281,42 @@ pub fn scan_json_column_offsets(
             while i < size && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
                 i += 1;
             }
-            if i >= size || bytes[i] != b':' {
-                continue;
+            if i >= size {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "expected ':' after key '{}' but reached end of JSON",
+                    col
+                )));
+            }
+            if bytes[i] != b':' {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "expected ':' after key '{}' at byte {}, found '{}'",
+                    col,
+                    i,
+                    bytes[i] as char
+                )));
             }
             i += 1;
             while i < size && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
                 i += 1;
             }
 
-            if i < size && bytes[i] == b'[' {
-                curr_col = Some(col);
-                depth = 1;
-                i += 1;
+            if i >= size {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "expected array value for key '{}' but reached end of JSON",
+                    col
+                )));
             }
+            if bytes[i] != b'[' {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "expected array value for key '{}' at byte {}, found '{}'",
+                    col,
+                    i,
+                    bytes[i] as char
+                )));
+            }
+            curr_col = Some(col);
+            depth = 1;
+            i += 1;
             continue;
         }
 

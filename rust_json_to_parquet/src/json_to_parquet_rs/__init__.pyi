@@ -8,6 +8,7 @@ def convert_json_to_parquet(
     schema: dict[str, str],
     config: Mapping[str, object],
     sample_rows: int | None = ...,
+    print_timing: bool = ...,
 ) -> dict[str, float]: ...
 
 def convert_json_to_parquet_passthrough(
@@ -17,4 +18,5 @@ def convert_json_to_parquet_passthrough(
     schema: dict[str, str],
     config: Mapping[str, object],
     sample_rows: int | None = ...,
+    print_timing: bool = ...,
 ) -> dict[str, float]: ...

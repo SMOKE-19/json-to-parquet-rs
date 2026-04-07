@@ -170,6 +170,42 @@ class CoreConversionTests(unittest.TestCase):
                 self.assertEqual(value_len, coord_a_len)
                 self.assertEqual(value_len, coord_b_len)
 
+    def test_convert_json_to_parquet_accepts_print_timing_option(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "sample.typed.parquet"
+            profile = convert_json_to_parquet(
+                input_json_path=str(self.sample_json),
+                output_parquet_path=str(output_path),
+                lookup_path=str(self.lookup_parquet),
+                columns=self.columns,
+                schema=self.schema,
+                config=self.config,
+                sample_rows=1,
+                print_timing=True,
+            )
+            self.assertEqual(profile["rows"], 1.0)
+            self.assertTrue(output_path.exists())
+
+    def test_convert_json_to_parquet_passthrough_accepts_print_timing_option(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "sample.passthrough_timing.parquet"
+            profile = convert_json_to_parquet_passthrough(
+                input_json_path=str(self.sample_json),
+                output_parquet_path=str(output_path),
+                columns=self.columns,
+                schema=self.schema,
+                config={
+                    "output": {
+                        "pass_through": self.columns,
+                        "derived": [],
+                    }
+                },
+                sample_rows=2,
+                print_timing=True,
+            )
+            self.assertEqual(profile["rows"], 2.0)
+            self.assertTrue(output_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
