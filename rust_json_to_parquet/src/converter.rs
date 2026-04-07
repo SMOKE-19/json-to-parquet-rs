@@ -2,6 +2,8 @@ use arrow_array::builder::{ListBuilder, PrimitiveBuilder, StringBuilder};
 use arrow_array::types::{Float64Type, Int32Type};
 use arrow_array::{ArrayRef, Float64Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use memchr::memchr;
+use memmap2::Mmap;
 use parquet::arrow::ArrowWriter;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -9,8 +11,10 @@ use std::fs::File;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::json_parser::extract_json_columns_profiled;
+use crate::json_parser::{extract_top_level_array_ranges, find_json_string_end};
 use crate::reference::{build_dense_index, load_reference_map, restore_dense_row, DenseRow};
+
+const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn emit_timing(stage_kind: &str, input_json_path: &str, output_parquet_path: &str, stats: &HashMap<String, f64>) {
     println!(
@@ -41,6 +45,16 @@ fn emit_timing(stage_kind: &str, input_json_path: &str, output_parquet_path: &st
             println!("[json_to_parquet_rs]   {key}={value:.6}");
         }
     }
+}
+
+fn emit_stage_banner(stage_kind: &str, input_json_path: &str, output_parquet_path: &str) {
+    println!(
+        "[json_to_parquet_rs] version={PKG_VERSION} stage={stage_kind} input_json_path={input_json_path} output_parquet_path={output_parquet_path}"
+    );
+}
+
+fn emit_stage_metric(stage_kind: &str, key: &str, value: f64) {
+    println!("[json_to_parquet_rs] stage={stage_kind} {key}={value:.6}");
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +126,13 @@ struct RestoreColumns {
     coord_rows: Vec<Vec<Vec<i32>>>,
 }
 
+#[derive(Debug)]
+struct OpenJsonProfile {
+    mmap: Mmap,
+    file_open_sec: f64,
+    mmap_sec: f64,
+}
+
 fn normalize_dtype(dtype: &str) -> &str {
     match dtype {
         "TEXT" | "Utf8" | "String" => "TEXT",
@@ -129,6 +150,368 @@ fn normalize_dtype(dtype: &str) -> &str {
         "TEXT[]" | "List(Utf8)" | "List(String)" => "TEXT[]",
         _ => dtype,
     }
+}
+
+fn open_mmap_json(json_path: &str) -> pyo3::PyResult<OpenJsonProfile> {
+    let open_started = Instant::now();
+    let file = File::open(json_path).map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "failed to open json file {json_path}: {err}"
+        ))
+    })?;
+    let file_open_sec = open_started.elapsed().as_secs_f64();
+
+    let mmap_started = Instant::now();
+    let mmap = unsafe {
+        Mmap::map(&file).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "failed to mmap json file {json_path}: {err}"
+            ))
+        })?
+    };
+    let mmap_sec = mmap_started.elapsed().as_secs_f64();
+
+    Ok(OpenJsonProfile {
+        mmap,
+        file_open_sec,
+        mmap_sec,
+    })
+}
+
+fn skip_ws(bytes: &[u8], mut index: usize, end: usize) -> usize {
+    while index < end && matches!(bytes[index], b' ' | b'\t' | b'\r' | b'\n') {
+        index += 1;
+    }
+    index
+}
+
+fn trim_ascii_ws(bytes: &[u8], start: usize, mut end: usize) -> (usize, usize) {
+    let mut start = start;
+    while start < end && matches!(bytes[start], b' ' | b'\t' | b'\r' | b'\n') {
+        start += 1;
+    }
+    while end > start && matches!(bytes[end - 1], b' ' | b'\t' | b'\r' | b'\n') {
+        end -= 1;
+    }
+    (start, end)
+}
+
+fn parse_utf8_token(bytes: &[u8], start: usize, end: usize) -> pyo3::PyResult<String> {
+    let (start, end) = trim_ascii_ws(bytes, start, end);
+    if start >= end {
+        return Ok(String::new());
+    }
+    if bytes[start] == b'"' {
+        let raw = std::str::from_utf8(&bytes[start..end]).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid utf-8 in JSON string: {err}"))
+        })?;
+        return serde_json::from_str::<String>(raw).map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid JSON string token: {err}"))
+        });
+    }
+    std::str::from_utf8(&bytes[start..end])
+        .map(str::to_string)
+        .map_err(|err| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid utf-8 in scalar token: {err}"))
+        })
+}
+
+fn parse_i32_token(bytes: &[u8], start: usize, end: usize, name: &str) -> pyo3::PyResult<i32> {
+    let raw = parse_utf8_token(bytes, start, end)?;
+    raw.parse::<i32>().map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid {name} '{raw}': {err}"))
+    })
+}
+
+fn parse_f64_token(bytes: &[u8], start: usize, end: usize, name: &str) -> pyo3::PyResult<f64> {
+    let raw = parse_utf8_token(bytes, start, end)?;
+    raw.parse::<f64>().map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid {name} '{raw}': {err}"))
+    })
+}
+
+fn next_comma(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    memchr(b',', &bytes[start..end]).map(|offset| start + offset)
+}
+
+fn parse_utf8_array_safe(bytes: &[u8], range: (usize, usize)) -> pyo3::PyResult<Vec<String>> {
+    let mut values = Vec::new();
+    let mut index = skip_ws(bytes, range.0, range.1);
+    while index < range.1 {
+        if bytes[index] == b',' {
+            index = skip_ws(bytes, index + 1, range.1);
+            continue;
+        }
+
+        if bytes[index] == b'"' {
+            let next = find_json_string_end(bytes, index)?;
+            values.push(parse_utf8_token(bytes, index, next)?);
+            index = skip_ws(bytes, next, range.1);
+        } else {
+            let token_end = next_comma(bytes, index, range.1).unwrap_or(range.1);
+            values.push(parse_utf8_token(bytes, index, token_end)?);
+            index = skip_ws(bytes, token_end, range.1);
+        }
+
+        if index < range.1 && bytes[index] == b',' {
+            index = skip_ws(bytes, index + 1, range.1);
+        }
+    }
+    Ok(values)
+}
+
+fn parse_utf8_array_fast(
+    bytes: &[u8],
+    range: (usize, usize),
+    expected_rows: usize,
+) -> pyo3::PyResult<Vec<String>> {
+    let mut values = Vec::with_capacity(expected_rows);
+    let mut index = skip_ws(bytes, range.0, range.1);
+    while index < range.1 {
+        if bytes[index] == b',' {
+            index = skip_ws(bytes, index + 1, range.1);
+            continue;
+        }
+        let token_end = next_comma(bytes, index, range.1).unwrap_or(range.1);
+        values.push(parse_utf8_token(bytes, index, token_end)?);
+        index = skip_ws(bytes, token_end, range.1);
+        if index < range.1 && bytes[index] == b',' {
+            index = skip_ws(bytes, index + 1, range.1);
+        }
+    }
+    if values.len() != expected_rows {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "string fast-path row mismatch: expected {expected_rows}, got {}",
+            values.len()
+        )));
+    }
+    Ok(values)
+}
+
+fn parse_bare_scalar_array<T, F>(
+    bytes: &[u8],
+    range: (usize, usize),
+    expected_rows: Option<usize>,
+    mut parse_token: F,
+) -> pyo3::PyResult<Vec<T>>
+where
+    F: FnMut(&[u8], usize, usize) -> pyo3::PyResult<T>,
+{
+    let capacity = expected_rows.unwrap_or(16);
+    let mut values = Vec::with_capacity(capacity);
+    let mut index = skip_ws(bytes, range.0, range.1);
+    while index < range.1 {
+        if bytes[index] == b',' {
+            index = skip_ws(bytes, index + 1, range.1);
+            continue;
+        }
+        let token_end = next_comma(bytes, index, range.1).unwrap_or(range.1);
+        values.push(parse_token(bytes, index, token_end)?);
+        index = skip_ws(bytes, token_end, range.1);
+        if index < range.1 && bytes[index] == b',' {
+            index = skip_ws(bytes, index + 1, range.1);
+        }
+    }
+    if let Some(expected) = expected_rows {
+        if values.len() != expected {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "scalar row mismatch: expected {expected}, got {}",
+                values.len()
+            )));
+        }
+    }
+    Ok(values)
+}
+
+fn extract_passthrough_scalar_outputs_profiled(
+    input_json_path: &str,
+    columns: &[String],
+    schema: &HashMap<String, String>,
+    pass_through: &[String],
+    sample_rows: Option<usize>,
+) -> pyo3::PyResult<(Vec<OutputColumn>, HashMap<String, f64>)> {
+    let open = open_mmap_json(input_json_path)?;
+
+    let scan_started = Instant::now();
+    let array_ranges = extract_top_level_array_ranges(&open.mmap, columns)?;
+    let scan_sec = scan_started.elapsed().as_secs_f64();
+
+    let parse_started = Instant::now();
+    let mut outputs = Vec::with_capacity(pass_through.len());
+    let mut expected_rows: Option<usize> = None;
+
+    for column_name in pass_through {
+        let range = array_ranges.get(column_name).copied().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "top-level array range missing for column {column_name}"
+            ))
+        })?;
+        let dtype = normalized_schema_type(schema, column_name)?;
+        let values = match dtype {
+            "TEXT" | "TIMESTAMP" | "DATE" => {
+                let rows = match expected_rows {
+                    Some(expected) => parse_utf8_array_fast(&open.mmap, range, expected)
+                        .or_else(|_| parse_utf8_array_safe(&open.mmap, range))?,
+                    None => parse_utf8_array_safe(&open.mmap, range)?,
+                };
+                if expected_rows.is_none() {
+                    expected_rows = Some(rows.len());
+                }
+                let rows = if let Some(limit) = sample_rows {
+                    rows.into_iter().take(limit).collect()
+                } else {
+                    rows
+                };
+                OutputColumnValues::Utf8(rows)
+            }
+            "TINYINT" | "INTEGER" => {
+                let mut rows = parse_bare_scalar_array(
+                    &open.mmap,
+                    range,
+                    expected_rows,
+                    |bytes, start, end| parse_i32_token(bytes, start, end, column_name),
+                )?;
+                if expected_rows.is_none() {
+                    expected_rows = Some(rows.len());
+                }
+                if let Some(limit) = sample_rows {
+                    rows.truncate(limit);
+                }
+                OutputColumnValues::Int32(rows)
+            }
+            "FLOAT" | "DOUBLE" => {
+                let mut rows = parse_bare_scalar_array(
+                    &open.mmap,
+                    range,
+                    expected_rows,
+                    |bytes, start, end| parse_f64_token(bytes, start, end, column_name),
+                )?;
+                if expected_rows.is_none() {
+                    expected_rows = Some(rows.len());
+                }
+                if let Some(limit) = sample_rows {
+                    rows.truncate(limit);
+                }
+                OutputColumnValues::Float64(rows)
+            }
+            other if other.starts_with("DECIMAL(") => {
+                let mut rows = parse_bare_scalar_array(
+                    &open.mmap,
+                    range,
+                    expected_rows,
+                    |bytes, start, end| parse_f64_token(bytes, start, end, column_name),
+                )?;
+                if expected_rows.is_none() {
+                    expected_rows = Some(rows.len());
+                }
+                if let Some(limit) = sample_rows {
+                    rows.truncate(limit);
+                }
+                OutputColumnValues::Float64(rows)
+            }
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "passthrough fast path does not support type {other} for column {column_name}"
+                )));
+            }
+        };
+
+        outputs.push(OutputColumn {
+            name: column_name.clone(),
+            values,
+        });
+    }
+
+    let parse_sec = parse_started.elapsed().as_secs_f64();
+    let rows_total = expected_rows.unwrap_or(0);
+
+    let mut profile = HashMap::new();
+    profile.insert("file_open_sec".to_string(), open.file_open_sec);
+    profile.insert("mmap_sec".to_string(), open.mmap_sec);
+    profile.insert("scan_offsets_sec".to_string(), scan_sec);
+    profile.insert("materialize_strings_sec".to_string(), 0.0);
+    profile.insert("rows_total".to_string(), rows_total as f64);
+    profile.insert(
+        "rows_materialized".to_string(),
+        sample_rows.map(|limit| limit.min(rows_total)).unwrap_or(rows_total) as f64,
+    );
+    profile.insert("typed_parse_sec".to_string(), parse_sec);
+
+    Ok((outputs, profile))
+}
+
+fn collect_restore_required_columns(config: &ConversionConfig) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut push_unique = |name: &str| {
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
+    };
+
+    push_unique(&config.lookup.key_column);
+    push_unique(&config.restore.source.value);
+    for name in &config.restore.source.coords {
+        push_unique(name);
+    }
+    for name in &config.output.pass_through {
+        push_unique(name);
+    }
+    for derived in &config.output.derived {
+        push_unique(&derived.from);
+    }
+
+    names
+}
+
+fn extract_restore_inputs_profiled(
+    input_json_path: &str,
+    columns: &[String],
+    config: &ConversionConfig,
+    sample_rows: Option<usize>,
+) -> pyo3::PyResult<(HashMap<String, Vec<String>>, HashMap<String, f64>)> {
+    let open = open_mmap_json(input_json_path)?;
+
+    let scan_started = Instant::now();
+    let array_ranges = extract_top_level_array_ranges(&open.mmap, columns)?;
+    let scan_sec = scan_started.elapsed().as_secs_f64();
+
+    let parse_started = Instant::now();
+    let required_columns = collect_restore_required_columns(config);
+    let mut extracted = HashMap::with_capacity(required_columns.len());
+    let mut total_rows = 0usize;
+
+    for column_name in required_columns {
+        let range = array_ranges.get(&column_name).copied().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "top-level array range missing for column {column_name}"
+            ))
+        })?;
+        let mut values = parse_utf8_array_safe(&open.mmap, range)?;
+        if total_rows == 0 {
+            total_rows = values.len();
+        } else if values.len() != total_rows {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "column row mismatch for {column_name}: expected {total_rows}, got {}",
+                values.len()
+            )));
+        }
+        if let Some(limit) = sample_rows {
+            values.truncate(limit);
+        }
+        extracted.insert(column_name, values);
+    }
+
+    let parse_sec = parse_started.elapsed().as_secs_f64();
+    let rows_materialized = sample_rows.map(|limit| limit.min(total_rows)).unwrap_or(total_rows);
+
+    let mut profile = HashMap::new();
+    profile.insert("file_open_sec".to_string(), open.file_open_sec);
+    profile.insert("mmap_sec".to_string(), open.mmap_sec);
+    profile.insert("scan_offsets_sec".to_string(), scan_sec);
+    profile.insert("materialize_strings_sec".to_string(), parse_sec);
+    profile.insert("rows_total".to_string(), total_rows as f64);
+    profile.insert("rows_materialized".to_string(), rows_materialized as f64);
+    Ok((extracted, profile))
 }
 
 fn parse_conversion_config(config_json: &str) -> pyo3::PyResult<ConversionConfig> {
@@ -304,39 +687,6 @@ fn validate_passthrough_scalar_schema(
         }
     }
     Ok(())
-}
-
-fn parse_passthrough_scalar_outputs(
-    extracted: &HashMap<String, Vec<String>>,
-    schema: &HashMap<String, String>,
-    pass_through: &[String],
-) -> pyo3::PyResult<Vec<OutputColumn>> {
-    let mut outputs = Vec::with_capacity(pass_through.len());
-    for column_name in pass_through {
-        let raw_values = required_column(extracted, column_name)?.clone();
-        let values = match normalized_schema_type(schema, column_name)? {
-            "TEXT" | "TIMESTAMP" | "DATE" => OutputColumnValues::Utf8(raw_values),
-            "TINYINT" | "INTEGER" => {
-                OutputColumnValues::Int32(parse_i32_values(&raw_values, column_name)?)
-            }
-            "FLOAT" | "DOUBLE" => {
-                OutputColumnValues::Float64(parse_f64_values(&raw_values, column_name)?)
-            }
-            other if other.starts_with("DECIMAL(") => {
-                OutputColumnValues::Float64(parse_f64_values(&raw_values, column_name)?)
-            }
-            other => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "passthrough fast path does not support type {other} for column {column_name}"
-                )));
-            }
-        };
-        outputs.push(OutputColumn {
-            name: column_name.clone(),
-            values,
-        });
-    }
-    Ok(outputs)
 }
 
 fn build_derived_outputs(
@@ -583,11 +933,17 @@ pub fn convert_json_to_parquet_impl(
 ) -> pyo3::PyResult<HashMap<String, f64>> {
     let total_started = Instant::now();
     let config = parse_conversion_config(&config_json)?;
+    if print_timing {
+        emit_stage_banner("restore", &input_json_path, &output_parquet_path);
+    }
 
     let extract_started = Instant::now();
     let (extracted, extract_profile) =
-        extract_json_columns_profiled(&input_json_path, &columns, &schema, sample_rows)?;
+        extract_restore_inputs_profiled(&input_json_path, &columns, &config, sample_rows)?;
     let extract_sec = extract_started.elapsed().as_secs_f64();
+    if print_timing {
+        emit_stage_metric("restore", "extract_sec", extract_sec);
+    }
 
     let refs_started = Instant::now();
     let refs = load_reference_map(
@@ -597,6 +953,9 @@ pub fn convert_json_to_parquet_impl(
         &config.lookup.coord_columns,
     )?;
     let refs_sec = refs_started.elapsed().as_secs_f64();
+    if print_timing {
+        emit_stage_metric("restore", "reference_load_sec", refs_sec);
+    }
 
     let nrows = required_column(&extracted, &config.lookup.key_column)?.len();
 
@@ -604,18 +963,42 @@ pub fn convert_json_to_parquet_impl(
     let scalar_outputs = parse_scalar_outputs(&extracted, &schema, &config)?;
     let derived_outputs = build_derived_outputs(&extracted, &config)?;
     let parse_scalar_sec = parse_scalar_started.elapsed().as_secs_f64();
+    if print_timing {
+        emit_stage_metric("restore", "parse_scalar_sec", parse_scalar_sec);
+    }
 
     let restore_started = Instant::now();
     let (restored, restore_metrics) = build_restore_outputs(&extracted, &refs, &config)?;
     let restore_sec = restore_started.elapsed().as_secs_f64();
+    if print_timing {
+        if let Some(value) = restore_metrics.get("parse_float_sec") {
+            emit_stage_metric("restore", "parse_float_sec", *value);
+        }
+        if let Some(value) = restore_metrics.get("parse_il1_sec") {
+            emit_stage_metric("restore", "parse_il1_sec", *value);
+        }
+        if let Some(value) = restore_metrics.get("parse_il2_sec") {
+            emit_stage_metric("restore", "parse_il2_sec", *value);
+        }
+        if let Some(value) = restore_metrics.get("dense_fill_sec") {
+            emit_stage_metric("restore", "dense_fill_sec", *value);
+        }
+        emit_stage_metric("restore", "restore_sec", restore_sec);
+    }
 
     let arrow_started = Instant::now();
     let batch = build_arrow_batch(&config, derived_outputs, scalar_outputs, restored)?;
     let arrow_sec = arrow_started.elapsed().as_secs_f64();
+    if print_timing {
+        emit_stage_metric("restore", "arrow_batch_build_sec", arrow_sec);
+    }
 
     let write_started = Instant::now();
     write_parquet_batch(&batch, &output_parquet_path)?;
     let parquet_write_sec = write_started.elapsed().as_secs_f64();
+    if print_timing {
+        emit_stage_metric("restore", "parquet_write_sec", parquet_write_sec);
+    }
 
     let mut stats = HashMap::new();
     stats.insert("rows".to_string(), nrows as f64);
@@ -629,6 +1012,14 @@ pub fn convert_json_to_parquet_impl(
         "total_sec".to_string(),
         total_started.elapsed().as_secs_f64(),
     );
+    if print_timing {
+        if let Some(rows) = stats.get("rows") {
+            emit_stage_metric("restore", "rows", *rows);
+        }
+        if let Some(total_sec) = stats.get("total_sec") {
+            emit_stage_metric("restore", "total_sec", *total_sec);
+        }
+    }
     for (key, value) in restore_metrics {
         stats.insert(key, value);
     }
@@ -658,30 +1049,48 @@ pub fn convert_json_to_parquet_passthrough_impl(
     let total_started = Instant::now();
     let config = parse_passthrough_config(&config_json)?;
     validate_passthrough_scalar_schema(&schema, &config.output.pass_through)?;
+    if print_timing {
+        emit_stage_banner("passthrough", &input_json_path, &output_parquet_path);
+    }
 
     let extract_started = Instant::now();
-    let (extracted, extract_profile) =
-        extract_json_columns_profiled(&input_json_path, &columns, &schema, sample_rows)?;
+    let (scalar_outputs, extract_profile) = extract_passthrough_scalar_outputs_profiled(
+        &input_json_path,
+        &columns,
+        &schema,
+        &config.output.pass_through,
+        sample_rows,
+    )?;
     let extract_sec = extract_started.elapsed().as_secs_f64();
+    if print_timing {
+        emit_stage_metric("passthrough", "extract_sec", extract_sec);
+    }
 
     let parse_scalar_started = Instant::now();
-    let scalar_outputs =
-        parse_passthrough_scalar_outputs(&extracted, &schema, &config.output.pass_through)?;
+    let scalar_outputs = scalar_outputs;
     let parse_scalar_sec = parse_scalar_started.elapsed().as_secs_f64();
+    if print_timing {
+        emit_stage_metric("passthrough", "parse_scalar_sec", parse_scalar_sec);
+    }
 
     let arrow_started = Instant::now();
     let batch = build_record_batch(scalar_outputs)?;
     let arrow_sec = arrow_started.elapsed().as_secs_f64();
+    if print_timing {
+        emit_stage_metric("passthrough", "arrow_batch_build_sec", arrow_sec);
+    }
 
     let write_started = Instant::now();
     write_parquet_batch(&batch, &output_parquet_path)?;
     let parquet_write_sec = write_started.elapsed().as_secs_f64();
+    if print_timing {
+        emit_stage_metric("passthrough", "parquet_write_sec", parquet_write_sec);
+    }
 
-    let nrows = columns
-        .first()
-        .and_then(|column| extracted.get(column))
-        .map(|values| values.len())
-        .unwrap_or(0);
+    let nrows = extract_profile
+        .get("rows_materialized")
+        .copied()
+        .unwrap_or(0.0) as usize;
 
     let mut stats = HashMap::new();
     stats.insert("rows".to_string(), nrows as f64);
@@ -694,6 +1103,14 @@ pub fn convert_json_to_parquet_passthrough_impl(
         "total_sec".to_string(),
         total_started.elapsed().as_secs_f64(),
     );
+    if print_timing {
+        if let Some(rows) = stats.get("rows") {
+            emit_stage_metric("passthrough", "rows", *rows);
+        }
+        if let Some(total_sec) = stats.get("total_sec") {
+            emit_stage_metric("passthrough", "total_sec", *total_sec);
+        }
+    }
     for (key, value) in extract_profile {
         stats.insert(format!("extract_{key}"), value);
     }

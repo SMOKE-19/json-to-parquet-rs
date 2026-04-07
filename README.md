@@ -17,7 +17,7 @@
 wheel을 받았다면 일반 Python 패키지처럼 설치하면 된다.
 
 ```bash
-pip install json_to_parquet_rs-0.1.0-*.whl
+pip install json_to_parquet_rs-0.2.0-*.whl
 ```
 
 개발 중이라면 저장소 루트에서 editable 설치가 가능하다.

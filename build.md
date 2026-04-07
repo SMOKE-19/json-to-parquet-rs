@@ -59,14 +59,14 @@ python -m maturin build --manifest-path rust_json_to_parquet/Cargo.toml
 
 예시 파일명:
 
-- `json_to_parquet_rs-0.1.0-cp314-cp314-linux_x86_64.whl`
+- `json_to_parquet_rs-0.2.0-cp314-cp314-linux_x86_64.whl`
 
 ## wheel 설치
 
 빌드한 wheel은 일반 패키지처럼 설치한다.
 
 ```bash
-pip install --force-reinstall rust_json_to_parquet/target/wheels/json_to_parquet_rs-0.1.0-*.whl
+pip install --force-reinstall rust_json_to_parquet/target/wheels/json_to_parquet_rs-0.2.0-*.whl
 ```
 
 설치 후 최소 확인:

@@ -20,9 +20,12 @@ from .json_to_parquet_rs import (
 )
 
 __all__ = [
+    "__version__",
     "convert_json_to_parquet",
     "convert_json_to_parquet_passthrough",
 ]
+
+__version__ = "0.2.0"
 
 
 def convert_json_to_parquet(

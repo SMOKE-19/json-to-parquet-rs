@@ -406,10 +406,11 @@ dependencies = [
 
 [[package]]
 name = "json_to_parquet_rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "memchr",
  "memmap2",
  "parquet",
  "pyo3",
